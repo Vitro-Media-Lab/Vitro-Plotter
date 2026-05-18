@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vitro Vector Engine v3 — Paper.js</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0a0a0f;
+            color: #e0e0e0;
+        }
+        #previewCanvas {
+            background: #ffffff;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            display: block;
+            cursor: crosshair;
+            /* VitroEngine.resize() sets explicit width/height inline to match
+               the paper aspect ratio. No default width/height here so the
+               inline style takes effect without competition. The flex parent
+               (items-center justify-center) handles centering. */
+        }
+        .sidebar-label {
+            @apply text-sm font-medium text-gray-300 mb-1 block;
+        }
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 5px;
+            background: #1e1e3a;
+            border-radius: 3px;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #06b6d4;
+            cursor: pointer;
+            border: 2px solid #22d3ee;
+            transition: box-shadow 0.2s;
+        }
+        input[type="range"]::-webkit-slider-thumb:hover {
+            box-shadow: 0 0 12px rgba(6, 182, 212, 0.5);
+        }
+        input[type="range"]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #06b6d4;
+            cursor: pointer;
+            border: 2px solid #22d3ee;
+        }
+        input[type="range"]:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        input[type="range"]:disabled::-webkit-slider-thumb {
+            cursor: not-allowed;
+        }
+        .value-badge {
+            @apply text-xs font-mono bg-cyan-950/50 text-cyan-300 px-2 py-0.5 rounded;
+        }
+        .btn-primary {
+            @apply w-full py-2.5 px-5 rounded-lg font-semibold text-white transition-all duration-200 disabled:opacity-35 disabled:cursor-not-allowed;
+            background: linear-gradient(135deg, #06b6d4, #0891b2);
+        }
+        .btn-primary:not(:disabled):hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 20px rgba(6, 182, 212, 0.35);
+        }
+        .btn-primary:not(:disabled):active {
+            transform: translateY(0);
+        }
+        .btn-secondary {
+            @apply w-full py-2 px-4 rounded-lg font-medium text-sm text-gray-300 transition-all duration-200 disabled:opacity-35 disabled:cursor-not-allowed;
+            background: #1e1e3a;
+            border: 1px solid #2a2a5a;
+        }
+        .btn-secondary:not(:disabled):hover {
+            background: #2a2a5a;
+            border-color: #06b6d4;
+        }
+        .btn-export {
+            @apply w-full py-2 px-4 rounded-lg font-medium text-sm text-white transition-all duration-200;
+            background: #1a1a2e;
+            border: 1px solid #2a2a5a;
+        }
+        .btn-export:hover {
+            border-color: #06b6d4;
+            background: #1e1e3a;
+        }
+        .btn-export:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        .file-zone {
+            @apply border-2 border-dashed border-cyan-500/25 rounded-lg p-5 text-center cursor-pointer transition-all duration-200;
+            background: rgba(6, 182, 212, 0.04);
+        }
+        .file-zone:hover {
+            border-color: #06b6d4;
+            background: rgba(6, 182, 212, 0.08);
+        }
+        .file-zone.has-file {
+            border-color: #22c55e;
+            background: rgba(34, 197, 94, 0.05);
+        }
+        .stat-box {
+            @apply bg-gray-900/50 rounded-lg px-3 py-2 text-xs font-mono;
+        }
+        .status-badge {
+            @apply text-xs px-2 py-1 rounded-full font-medium;
+        }
+        .status-idle {
+            @apply bg-gray-800 text-gray-500;
+        }
+        .status-processing {
+            @apply bg-cyan-950/50 text-cyan-400;
+        }
+        .status-ready {
+            @apply bg-green-950/50 text-green-400;
+        }
+        .status-error {
+            @apply bg-red-950/50 text-red-400;
+        }
+        .panel-card {
+            @apply bg-neutral-900/80 rounded-xl p-4 border border-neutral-800/60;
+        }
+        .panel-title {
+            @apply text-xs font-semibold text-neutral-500 uppercase tracking-widest mb-3;
+        }
+        .algo-pill-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .algo-pill {
+            @apply text-xs font-medium px-3 py-1.5 rounded-full border transition-all duration-150 cursor-pointer select-none;
+            background: #1e1e2e;
+            border-color: #2a2a3a;
+            color: #6b7280;
+        }
+        .algo-pill:hover {
+            background: #2a2a3e;
+            color: #d1d5db;
+        }
+        .algo-pill.active {
+            background: #0891b2;
+            border-color: #06b6d4;
+            color: #ffffff;
+            font-weight: 700;
+            box-shadow: 0 0 12px rgba(6, 182, 212, 0.35);
+        }
+        .algo-pill input[type="radio"] {
+            position: absolute;
+            opacity: 0;
+            pointer-events: none;
+        }
+        ::-webkit-scrollbar {
+            width: 5px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #0a0a0f;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #1e1e3a;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #2a2a5a;
+        }
+        .channel-label {
+            @apply flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs font-medium cursor-pointer transition-all border;
+        }
+        .channel-label.active {
+            @apply ring-2 ring-cyan-400/60;
+        }
+        select {
+            @apply w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500 transition-colors cursor-pointer;
+        }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        .animate-spin {
+            animation: spin 1s linear infinite;
+        }
+    </style>
+  <script type="module" crossorigin src="/assets/index-CZctzJ_N.js"></script>
+</head>
+<body>
+    <!-- React mounts here -->
+    <div id="root"></div>
+
+    <!-- Vite entry point — loads src/main.jsx as ES module -->
+</body>
+</html>
