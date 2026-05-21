@@ -56,7 +56,8 @@ export async function checkSubscription() {
     if (!res.ok) return 'no_subscription';
 
     const data = await res.json().catch(() => ({}));
-    return Array.isArray(data.entitlements) && data.entitlements.includes('PLOTTER-ACCESS')
+    return Array.isArray(data.entitlements) &&
+        (data.entitlements.includes('PLOTTER-ACCESS') || data.entitlements.includes('DEVPASSPLOTTER'))
         ? 'approved'
         : 'no_subscription';
 }
