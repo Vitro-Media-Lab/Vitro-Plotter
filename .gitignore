@@ -1,0 +1,6 @@
+cache/
+.claude/
+todo.txt
+MiniArchitect/
+__pycache__
+node_modules
