@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { loginUser, checkSubscription } from '../services/auth.js';
 
-const SHOP_URL = 'https://www.vitromedialab.com/shop';
+const SHOP_URL = 'https://www.vitromedialab.com/designs';
 
 export default function Paywall({ onApproved }) {
     const [username, setUsername] = useState('');
