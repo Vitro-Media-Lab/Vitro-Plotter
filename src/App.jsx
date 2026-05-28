@@ -259,6 +259,11 @@ export default function App() {
           await runAlgorithm('calligraphy', engine.project, null, getAlgoParams());
         }
 
+        // SVG paths are already in paper-mm space (baked via path.transform above).
+        // Calling convertPathsToMm with paper dimensions is an identity transform,
+        // but it populates mmPathData so restoreMmCoords works correctly on export.
+        convertPathsToMm(engine, s.paperWidth, s.paperHeight);
+
         await applyPostProcessing();
 
         // ── Cache rasterized SVG for raster algorithm switching ──
@@ -331,12 +336,82 @@ export default function App() {
       const markers = s.activeMarkers;
       if (!markers || markers.length === 0) return;
 
+      const currentAlgo = s.currentAlgo || algo;
+
+      // ── Dual-layer moiré algorithms: run ONCE, split by moire_layer tag ──
+      // These algorithms encode two independent layers (cyan + magenta) that
+      // must be generated from the full grayscale image — not from per-marker
+      // color separations. Running them once avoids N×the cost and preserves
+      // the correct image encoding in each layer.
+      const DUAL_LAYER_MOIRE = new Set(['staticmoire', 'curvilinearnoise', 'warpedgrid', 'freqmod']);
+      if (DUAL_LAYER_MOIRE.has(currentAlgo)) {
+        engine.clear();
+        const grayFull = new ImageData(new Uint8ClampedArray(imageData.data), width, height);
+        ImageUtils.toGrayscale(grayFull);
+        const grayGray = new ImageData(new Uint8ClampedArray(grayFull.data), width, height);
+        const baseParams = getAlgoParams();
+        await runAlgorithm(currentAlgo, engine.project, grayFull, baseParams, null, grayGray);
+
+        // Snapshot items by moire_layer BEFORE convertPathsToMm modifies coords.
+        // convertPathsToMm updates segment coordinates in-place, so these refs
+        // will hold mm-space coords after the call.
+        const itemsByLayer = { 1: [], 2: [] };
+        for (const item of engine.project.activeLayer.children) {
+          if (item instanceof paper.Path) {
+            const lyr = item.data?.moire_layer ?? 1;
+            (itemsByLayer[lyr] || itemsByLayer[1]).push(item);
+          }
+        }
+
+        convertPathsToMm(engine, width, height);
+
+        const collectItems = (items) =>
+          items.filter(it => it.segments && it.segments.length > 1)
+               .map(it => it.segments.map(seg => ({ x: seg.point.x, y: seg.point.y })));
+
+        // Map Layer 1 → first active marker, Layer 2 → second active marker.
+        // This lets the user switch pen colors via the normal marker UI.
+        const markerL1 = markers[0];
+        const markerL2 = markers[1] ?? markers[0];
+        const sameMarker = markerL1.id === markerL2.id;
+
+        const allPaths = {};
+        if (sameMarker) {
+          allPaths[markerL1.id] = [
+            ...collectItems(itemsByLayer[1]),
+            ...collectItems(itemsByLayer[2]),
+          ];
+        } else {
+          allPaths[markerL1.id] = collectItems(itemsByLayer[1]);
+          allPaths[markerL2.id] = collectItems(itemsByLayer[2]);
+        }
+        s.spotAllPaths = allPaths;
+
+        engine.clear();
+        const renderMarkers = sameMarker ? [markerL1] : [markerL1, markerL2];
+        for (const marker of renderMarkers) {
+          for (const pts of allPaths[marker.id] ?? []) {
+            const p = new paper.Path();
+            p.strokeColor = new paper.Color(marker.hex);
+            p.strokeWidth = 1;
+            for (const pt of pts) p.add(new paper.Point(pt.x, pt.y));
+            engine.project.activeLayer.addChild(p);
+          }
+        }
+        // Paths are already in mm-space; passing paperW×paperH as the image
+        // dimensions makes convertPathsToMm a no-op transform, but it updates
+        // mmPathData to reference the new path objects so restoreMmCoords works.
+        convertPathsToMm(engine, s.paperWidth, s.paperHeight);
+
+        await applyPostProcessing();
+        return;
+      }
+
       // separateSpotColors expects a color (non-grayscale) source; pass a copy
       // so the dithering pass doesn't mutate imageData (used by source preview).
       const colorCopy = new ImageData(new Uint8ClampedArray(imageData.data), width, height);
       const separated = ImageUtils.separateSpotColors(colorCopy, markers);
 
-      const currentAlgo = s.currentAlgo || algo;
       const isOutlineAlgo    = currentAlgo === 'subjectoutline'    || currentAlgo === 'outlinecrosshatch';
 
       // For outline algorithms, build a full-image grayscale before the channel
@@ -395,6 +470,10 @@ export default function App() {
           engine.project.activeLayer.addChild(p);
         }
       }
+      // Paths are already in mm-space; passing paperW×paperH as the image
+      // dimensions makes convertPathsToMm a no-op transform, but it updates
+      // mmPathData to reference the new path objects so restoreMmCoords works.
+      convertPathsToMm(engine, s.paperWidth, s.paperHeight);
     } else {
       engine.clear();
       ImageUtils.toGrayscale(imageData);
@@ -436,7 +515,29 @@ export default function App() {
       resolution: aw.resolution ?? 2,
       threshold: aw.threshold ?? 128,
       tolerance: aw.tolerance ?? 1,
-      blurRadius: 0,
+      blurRadius: aw.blurRadius ?? 0,
+      // ── Static Moiré Fringe parameters ──────────────────────
+      pitch:         aw.pitch         ?? 12,
+      fringeDensity: aw.fringeDensity ?? 0.8,
+      carrierType:       aw.carrierType       ?? 'circles',
+      carrierAngle:      aw.carrierAngle      ?? '0',
+      lineDensity:   aw.lineDensity   ?? 60,
+      contourHeight: aw.contourHeight ?? 5,
+      topoAngle:     aw.topoAngle     ?? '45',
+      // ── Curvilinear Noise Moiré parameters ───────────────────
+      noiseGridAngle1: aw.noiseGridAngle1 ?? 30,
+      noiseGridAngle2: aw.noiseGridAngle2 ?? 60,
+      noiseScale:      aw.noiseScale      ?? 300,
+      noiseAmplitude:  aw.noiseAmplitude  ?? 3,
+      fringeIntensity: aw.fringeIntensity ?? 0.8,
+      moireLayerView:  aw.moireLayerView  ?? 'both',
+      // ── Phase-Key / Freq-Mod Moiré parameters ────────────────
+      warpAngle1:    aw.warpAngle1    ?? 45,
+      warpAngle2:    aw.warpAngle2    ?? 135,
+      keyGeometry:   aw.keyGeometry   ?? 'lines',
+      keyType:       aw.keyType       ?? 'noise',
+      warpIntensity: aw.warpIntensity ?? 50,
+      dispBlur:      aw.dispBlur      ?? 15,
       pathomit: aw.pathomit ?? 8,
       minPathLength: aw.minPathLength ?? 10,
       // ── Calligraphy Parameters (Voronoi medial axis) ──────────
@@ -573,7 +674,7 @@ export default function App() {
    * applied from a clean mm-space state, even after previous transforms
    * (e.g., on resize).
    */
-  function layoutPaths(engine, paperW, paperH, margin) {
+  function layoutPaths(engine, paperW, paperH, margin, smoothIter = 0) {
     // Guard against null view — can happen if ResizeObserver fires before
     // Paper.js has fully initialised the view, or after unmount.
     if (!engine.scope.view) return;
@@ -581,8 +682,19 @@ export default function App() {
     const canvasW = viewSize.width;
     const canvasH = viewSize.height;
 
-    // Restore mm-space coordinates before computing the transform
+    // Restore mm-space coordinates before computing the transform.
+    // Smoothing must happen AFTER this restore so it operates on the clean
+    // mm-space baseline rather than on already-transformed pixel coordinates.
     restoreMmCoords(engine);
+
+    // Apply curve smoothing in mm-space, before the pixel transform.
+    // Doing it here (not before layoutPaths) ensures restoreMmCoords cannot
+    // overwrite the smoothed segments, which was the original bug.
+    if (smoothIter > 0) {
+      for (let i = 0; i < smoothIter; i++) {
+        engine.smoothAll('catmull-rom');
+      }
+    }
 
     // The paths are in mm coordinates spanning [0, paperW] × [0, paperH].
     // We want them to fit within a margin inset from the paper edges.
@@ -782,9 +894,12 @@ export default function App() {
       }
     }
 
+    const post = s.postWorkerSettings;
+    const smoothIter = post.smoothing ?? 0;
+
     if (isSpot && s.spotAllPaths) {
       // Layout Paper.js paths (all channels are already added to the project)
-      layoutPaths(engine, s.paperWidth, s.paperHeight, margin);
+      layoutPaths(engine, s.paperWidth, s.paperHeight, margin, smoothIter);
 
       // Set stroke properties on ALL Paper.js paths (artwork + labels)
       // Clear fillColor so SVG paths render as strokes only
@@ -833,16 +948,7 @@ export default function App() {
       return;
     }
 
-    // Apply smoothing from debounced post-process settings
-    const post = s.postWorkerSettings;
-    const smoothIter = post.smoothing ?? 0;
-    if (smoothIter > 0) {
-      for (let i = 0; i < smoothIter; i++) {
-        engine.smoothAll('catmull-rom');
-      }
-    }
-
-    layoutPaths(engine, s.paperWidth, s.paperHeight, margin);
+    layoutPaths(engine, s.paperWidth, s.paperHeight, margin, smoothIter);
 
     const strokeColor = inkColor;
 
@@ -1084,8 +1190,10 @@ export default function App() {
     const marginEl = document.getElementById('marginSlider');
     const margin = parseInt(marginEl?.value || '10');
 
+    const smoothIter = s.postWorkerSettings?.smoothing ?? 0;
+
     if (isSpot) {
-      layoutPaths(engine, s.paperWidth, s.paperHeight, margin);
+      layoutPaths(engine, s.paperWidth, s.paperHeight, margin, smoothIter);
       if (engine.scope.view) {
         engine.scope.view.draw();
       }
@@ -1094,7 +1202,7 @@ export default function App() {
 
     // For all other modes: just update the view matrix — no reprocessing needed.
     // Path coordinates are unchanged; only the Paper.js view transform changes.
-    layoutPaths(engine, s.paperWidth, s.paperHeight, margin);
+    layoutPaths(engine, s.paperWidth, s.paperHeight, margin, smoothIter);
     if (engine.scope.view) {
       engine.scope.view.draw();
     }
@@ -1336,9 +1444,9 @@ export default function App() {
       exportSvgBtn.addEventListener('click', () => {
         handleExportWithAllCheck(() => {
           const margin = parseInt(document.getElementById('marginSlider')?.value || '10');
-          // Restore mm-space coords before export reads segment points,
-          // then re-layout so the preview remains correct.
+          const smoothIter = stateRef.current.postWorkerSettings?.smoothing ?? 0;
           restoreMmCoords(engine);
+          if (smoothIter > 0) for (let i = 0; i < smoothIter; i++) engine.smoothAll('catmull-rom');
           const svg = ExportEngine.exportSVG(
             engine.project,
             stateRef.current.paperWidth,
@@ -1346,8 +1454,7 @@ export default function App() {
             margin
           );
           ExportEngine.downloadFile(svg, 'vitro_export.svg', 'image/svg+xml');
-          // Re-apply layout transform for correct preview
-          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin);
+          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, smoothIter);
           if (engine.scope.view) engine.scope.view.draw();
         });
       });
@@ -1365,11 +1472,11 @@ export default function App() {
         }
         handleExportWithAllCheck(() => {
           const margin = parseInt(document.getElementById('marginSlider')?.value || '10');
+          const smoothIter = stateRef.current.postWorkerSettings?.smoothing ?? 0;
           const engineResEl = document.getElementById('engineResolution');
           const engineRes = parseInt(engineResEl?.value || '1000');
-          // Restore mm-space coords before export reads segment points,
-          // then re-layout so the preview remains correct.
           restoreMmCoords(engine);
+          if (smoothIter > 0) for (let i = 0; i < smoothIter; i++) engine.smoothAll('catmull-rom');
           const dataUrl = ExportEngine.exportPNG(
             engine.project,
             stateRef.current.paperWidth,
@@ -1378,8 +1485,7 @@ export default function App() {
             engineRes
           );
           ExportEngine.downloadFile(dataUrl, 'vitro_export.png', 'image/png');
-          // Re-apply layout transform for correct preview
-          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin);
+          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, smoothIter);
           if (engine.scope.view) engine.scope.view.draw();
         });
       });
@@ -1411,20 +1517,19 @@ export default function App() {
         }
         handleExportWithAllCheck(() => {
           const margin = parseInt(document.getElementById('marginSlider')?.value || '10');
+          const smoothIter = stateRef.current.postWorkerSettings?.smoothing ?? 0;
           const zUp = parseFloat(document.getElementById('zUpSlider')?.value || '5');
           const zDown = parseFloat(document.getElementById('zDownSlider')?.value || '0.2');
           const feedrate = parseInt(document.getElementById('feedrateSlider')?.value || '3000');
-          // Restore mm-space coords before export reads segment points,
-          // then re-layout so the preview remains correct.
           restoreMmCoords(engine);
+          if (smoothIter > 0) for (let i = 0; i < smoothIter; i++) engine.smoothAll('catmull-rom');
           const result = ExportEngine.generateBambuGcode(
             engine.project, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, zUp, zDown, feedrate
           );
           ExportEngine.downloadFile(result.gcode, 'vitro_bambu.gcode', 'text/plain');
           const statGcode = document.getElementById('statGcode');
           if (statGcode) statGcode.textContent = `${fmt(result.totalPoints)} pts, ${(result.gcode.length / 1024).toFixed(1)} KB`;
-          // Re-apply layout transform for correct preview
-          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin);
+          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, smoothIter);
           if (engine.scope.view) engine.scope.view.draw();
         });
       });
@@ -1456,20 +1561,19 @@ export default function App() {
         }
         handleExportWithAllCheck(() => {
           const margin = parseInt(document.getElementById('marginSlider')?.value || '10');
+          const smoothIter = stateRef.current.postWorkerSettings?.smoothing ?? 0;
           const zUp = parseFloat(document.getElementById('zUpSlider')?.value || '5');
           const zDown = parseFloat(document.getElementById('zDownSlider')?.value || '0.2');
           const feedrate = parseInt(document.getElementById('feedrateSlider')?.value || '3000');
-          // Restore mm-space coords before export reads segment points,
-          // then re-layout so the preview remains correct.
           restoreMmCoords(engine);
+          if (smoothIter > 0) for (let i = 0; i < smoothIter; i++) engine.smoothAll('catmull-rom');
           const result = ExportEngine.generateGrblGcode(
             engine.project, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, zUp, zDown, feedrate
           );
           ExportEngine.downloadFile(result.gcode, 'vitro_grbl.gcode', 'text/plain');
           const statGcode = document.getElementById('statGcode');
           if (statGcode) statGcode.textContent = `${fmt(result.totalPoints)} pts, ${(result.gcode.length / 1024).toFixed(1)} KB`;
-          // Re-apply layout transform for correct preview
-          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin);
+          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, smoothIter);
           if (engine.scope.view) engine.scope.view.draw();
         });
       });
@@ -1507,13 +1611,13 @@ export default function App() {
         }
         handleExportWithAllCheck(() => {
           const margin = parseInt(document.getElementById('marginSlider')?.value || '10');
+          const smoothIter = stateRef.current.postWorkerSettings?.smoothing ?? 0;
           const zUp = parseFloat(document.getElementById('zUpSlider')?.value || '5');
           const zDown = parseFloat(document.getElementById('zDownSlider')?.value || '0.2');
           const feedrate = parseInt(document.getElementById('feedrateSlider')?.value || '3000');
 
-          // Restore mm-space coords before exports read segment points,
-          // then re-layout so the preview remains correct.
           restoreMmCoords(engine);
+          if (smoothIter > 0) for (let i = 0; i < smoothIter; i++) engine.smoothAll('catmull-rom');
 
           const svg = ExportEngine.exportSVG(
             engine.project,
@@ -1540,8 +1644,7 @@ export default function App() {
           const grbl = ExportEngine.generateGrblGcode(engine.project, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, zUp, zDown, feedrate);
           ExportEngine.downloadFile(grbl.gcode, 'vitro_grbl.gcode', 'text/plain');
 
-          // Re-apply layout transform for correct preview
-          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin);
+          layoutPaths(engine, stateRef.current.paperWidth, stateRef.current.paperHeight, margin, smoothIter);
           if (engine.scope.view) engine.scope.view.draw();
         });
       });

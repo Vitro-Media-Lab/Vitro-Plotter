@@ -113,15 +113,15 @@ export class VitroEngine {
    * @param {'catmull-rom'|'continuous'|'asymmetric'} type
    * @param {number} [flattenTolerance=0.5] — tolerance for flattening curves before smoothing
    */
-  smoothAll(type = 'catmull-rom', flattenTolerance = 0.5) {
+  smoothAll(type = 'catmull-rom') {
     function processItems(items) {
       for (const item of items) {
         if (item instanceof paper.Path) {
-          // Flatten any existing curves to polylines first so that
-          // smooth() operates on clean straight segments each time
-          if (item.curves.length > 0 && item.segments.length > 1) {
-            item.flatten(flattenTolerance);
-          }
+          // Do NOT flatten before smoothing — flatten can change the segment
+          // count, which breaks restoreMmCoords (it silently skips paths whose
+          // segment count no longer matches the saved mm-space snapshot).
+          // layoutPaths always calls restoreMmCoords first, so paths are already
+          // restored to their original straight-line polyline state on entry.
           item.smooth({ type });
         } else if (item instanceof paper.Group || item instanceof paper.CompoundPath) {
           processItems(item.children);

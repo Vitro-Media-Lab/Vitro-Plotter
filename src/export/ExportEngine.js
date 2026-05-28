@@ -17,6 +17,7 @@
  */
 import paper from 'paper';
 import { optimizeForPlotter } from './PathOptimizer.js';
+import { sortByProximity } from '../algorithms/ChainUtils.js';
 
 /**
  * Minimum path length filter threshold.
@@ -231,8 +232,9 @@ export class ExportEngine {
     // to determine pixels-per-mm, ensuring the exported PNG captures the same
     // level of detail as the preview.
     const pixelsPerMm = engineRes / paperWidth;
-    // Use at least 2 px/mm for a minimum quality floor
-    const scale = Math.max(2, Math.round(pixelsPerMm));
+    // Ensure the shorter dimension is at least 1080px
+    const minScale = 1080 / Math.min(paperWidth, paperHeight);
+    const scale = Math.max(minScale, Math.round(pixelsPerMm));
     const canvas = document.createElement('canvas');
     canvas.width = Math.round(paperWidth * scale);
     canvas.height = Math.round(paperHeight * scale);
@@ -363,7 +365,7 @@ M104 S0 ; No-wait temp
 M140 S0 ; No-wait bed
 M106 S0 ; Fans off
 G90 ; Absolute positioning
-G28 ; Home axes
+; G28 Home axes
 G92 E0 ; Reset extruder
 ; --- END START G-CODE ---`;
 
@@ -380,94 +382,89 @@ M84
     let gcode = START_GCODE + '\n';
     let totalPoints = 0;
 
-    // ── Path Optimization: deduplicate + chain segments ──
-    // Clone paths into a temporary project for optimization + scaling,
-    // avoiding redundant cloning (paths are cloned once, not 3x).
-    const tempProject = new paper.Project();
-    const tempLayer = tempProject.activeLayer;
     const allSrcPaths = ExportEngine._collectAllPaths(project.activeLayer);
-    for (const item of allSrcPaths) {
-      if (item.segments.length >= 2) {
-        tempLayer.addChild(item.clone());
+    const hasMoireLayers = allSrcPaths.some(p => p.data?.moire_layer != null);
+
+    // Optimize a set of Paper.js paths in an isolated temp project, flatten
+    // curves to polylines, and return them as plain {x,y} point arrays.
+    // The temp project is created and destroyed entirely within this helper
+    // so there is no risk of stale Paper.js state leaking back to the preview.
+    const getChains = (srcPaths) => {
+      if (srcPaths.length === 0) return [];
+      const tmp = new paper.Project();
+      tmp.activate();
+      for (const p of srcPaths) {
+        if (p.segments.length >= 2) tmp.activeLayer.addChild(p.clone());
       }
-    }
-    optimizeForPlotter(tempProject, 0.1);
-    // ── End Path Optimization ──
-
-    // ── Margin Transform ──────────────────────────────────────
-    // Apply the same margin transform as layoutPaths() in App.jsx:
-    //   contentScale = (paper - 2*margin) / paper
-    //   newX = oldX * contentScale + margin
-    //   newY = oldY * contentScale + margin
-    // This maps [0, paperW] × [0, paperH] → [margin, paperW-margin] × [margin, paperH-margin]
-    // Uses a UNIFORM content scale to preserve aspect ratio on non-square paper.
-    const contentScale = Math.min(
-      (paperW - 2 * margin) / paperW,
-      (paperH - 2 * margin) / paperH
-    );
-
-    // Helper to apply margin transform to a point
-    const marginX = (x) => x * contentScale + margin;
-    const marginY = (y) => y * contentScale + margin;
-
-    // 2. Coordinate Parsing
-    for (const item of tempLayer.children) {
-      if (item instanceof paper.Path) {
-        item.flatten(0.5); // Convert smooth curves to plotter segments
-
+      optimizeForPlotter(tmp, 0.1);
+      const chains = [];
+      for (const item of tmp.activeLayer.children) {
+        if (!(item instanceof paper.Path) || item.segments.length < 2) continue;
+        item.flatten(0.5);
         if (item.segments.length < 2) continue;
-
-        gcode += `G1 Z${zUp} F3000 ; pen up\n`;
-
-        let firstPoint = item.segments[0].point;
-        const fx = marginX(firstPoint.x);
-        const fy = marginY(firstPoint.y);
-        
-        // Bambu origin is bottom-left, Canvas origin is top-left. We flip Y.
-        gcode += `G1 X${fx.toFixed(3)} Y${(paperH - fy).toFixed(3)} F${feedrate}\n`;
-
-        // ── Variable Z-Depth Support ──────────────────────────────────
-        // If the first segment has zDepth metadata, use it for the initial
-        // pen-down position. Otherwise, fall back to the global zDown.
-        const firstZ = item.segments[0].data?.zDepth != null
-          ? item.segments[0].data.zDepth
-          : zDown;
-        gcode += `G1 Z${firstZ.toFixed(3)} F3000 ; pen down (z-depth)\n`;
-        totalPoints++;
-
-        let prevX = fx;
-        let prevY = fy;
-
-        for (let i = 1; i < item.segments.length; i++) {
-          let pt = item.segments[i].point;
-          const mx = marginX(pt.x);
-          const my = marginY(pt.y);
-          let dx = mx - prevX;
-          let dy = my - prevY;
-
-          // Skip microscopic line segments (< 0.1mm) to stop violent plotter vibration
-          if ((dx * dx + dy * dy) < 0.01) continue;
-
-          // ── Emit Z-depth change if this segment has metadata ──
-          // Only emit G1 Z when the Z value changes, to keep G-code compact.
-          const segZ = item.segments[i].data?.zDepth;
-          if (segZ != null) {
-            const prevZ = item.segments[i - 1]?.data?.zDepth;
-            if (prevZ == null || Math.abs(segZ - prevZ) > 0.001) {
-              gcode += `G1 Z${segZ.toFixed(3)} F3000\n`;
-            }
-          }
-
-          gcode += `G1 X${mx.toFixed(3)} Y${(paperH - my).toFixed(3)} F${feedrate}\n`;
-          totalPoints++;
-
-          prevX = mx;
-          prevY = my;
-        }
+        chains.push(item.segments.map(s => ({ x: s.point.x, y: s.point.y })));
       }
+      tmp.remove();
+      project.activate();
+      return chains;
+    };
+
+    // Build the final ordered path list.
+    // Dual-layer moiré plots are strictly segregated: Layer 1 is sorted and
+    // drawn completely before Layer 2 begins. Each layer is sorted
+    // independently top-to-bottom with bidirectional (boustrophedon) drawing.
+    let finalChains;
+    if (hasMoireLayers) {
+      const l1 = getChains(allSrcPaths.filter(p => p.data?.moire_layer === 1));
+      const l2 = getChains(allSrcPaths.filter(p => p.data?.moire_layer === 2));
+      finalChains = [...sortByProximity(l1), ...sortByProximity(l2)];
+    } else {
+      finalChains = sortByProximity(getChains(allSrcPaths));
     }
 
-    tempProject.remove();
+    // ── Coordinate Map: tool offset + margin scaling ─────────────────
+    const BED_W = 256.0;
+    const BED_H = 256.0;
+    const PEN_OFFSET_X = 0.0;
+    const PEN_OFFSET_Y = 50.0; // pen mounted 50mm forward of nozzle
+
+    const effectiveBedW = BED_W;
+    const effectiveBedH = BED_H - PEN_OFFSET_Y;
+
+    const printableW = effectiveBedW - (2 * margin);
+    const printableH = effectiveBedH - (2 * margin);
+
+    const scale = Math.min(printableW / paperW, printableH / paperH);
+
+    const offsetX = (effectiveBedW / 2) - ((paperW * scale) / 2);
+    const offsetY = (effectiveBedH / 2) - ((paperH * scale) / 2);
+
+    const toGX = (x) => offsetX + (x * scale) + PEN_OFFSET_X;
+    const toGY = (y) => offsetY + ((paperH - y) * scale) + PEN_OFFSET_Y;
+
+    // ── Emit G-code ───────────────────────────────────────────────────
+    for (const chain of finalChains) {
+      if (chain.length < 2) continue;
+
+      gcode += `G1 Z${zUp} F3000 ; pen up\n`;
+      const fx = toGX(chain[0].x);
+      const fy = toGY(chain[0].y);
+      gcode += `G1 X${fx.toFixed(3)} Y${fy.toFixed(3)} F${feedrate}\n`;
+      gcode += `G1 Z${zDown.toFixed(3)} F3000 ; pen down\n`;
+      totalPoints++;
+
+      let prevX = fx, prevY = fy;
+      for (let i = 1; i < chain.length; i++) {
+        const mx = toGX(chain[i].x);
+        const my = toGY(chain[i].y);
+        const dx = mx - prevX, dy = my - prevY;
+        if ((dx * dx + dy * dy) < 0.01) continue;
+        gcode += `G1 X${mx.toFixed(3)} Y${my.toFixed(3)} F${feedrate}\n`;
+        totalPoints++;
+        prevX = mx;
+        prevY = my;
+      }
+    }
 
     gcode += END_GCODE + '\n';
     return { gcode, totalPoints };
@@ -540,8 +537,8 @@ M84
 
         for (let i = 0; i < item.segments.length; i++) {
           const seg = item.segments[i];
-          const x = Math.max(margin, Math.min(paperW - margin, marginX(seg.point.x)));
-          const y = Math.max(margin, Math.min(paperH - margin, marginY(seg.point.y)));
+          const x = marginX(seg.point.x);
+          const y = marginY(seg.point.y);
 
           // Emit Z change if this segment has different Z than previous
           if (i > 0) {
@@ -561,8 +558,8 @@ M84
         // Legacy mode: no Z-depth data, use global zDown
         gcode += 'M3 S1000 ; spindle on (pen down)\n';
         for (const seg of item.segments) {
-          const x = Math.max(margin, Math.min(paperW - margin, marginX(seg.point.x)));
-          const y = Math.max(margin, Math.min(paperH - margin, marginY(seg.point.y)));
+          const x = marginX(seg.point.x);
+          const y = marginY(seg.point.y);
           gcode += `G1 X${x.toFixed(3)} Y${y.toFixed(3)} F${feedrate}\n`;
           totalPoints++;
         }
@@ -571,6 +568,7 @@ M84
     }
 
     tempProject.remove();
+    project.activate(); // restore main preview project as the active Paper.js project
 
     gcode += `G1 Z${zUp} F3000 ; pen up\n`;
     gcode += 'G1 X0 Y0 F3000 ; return home\n';
@@ -603,7 +601,7 @@ M84
       'M140 S0 ; No-wait bed',
       'M106 S0 ; Fans off',
       'G90 ; Absolute positioning',
-      'G28 ; Home axes',
+      // 'G28 ; Home axes', // intentionally omitted — manual home on power-up
       'G92 E0 ; Reset extruder',
       '; --- END START G-CODE ---',
     ].join('\n');
@@ -620,12 +618,24 @@ M84
       '; --- END G-CODE ---',
     ].join('\n');
 
-    const contentScale = Math.min(
-      (paperW - 2 * margin) / paperW,
-      (paperH - 2 * margin) / paperH
-    );
-    const marginX = (x) => x * contentScale + margin;
-    const marginY = (y) => y * contentScale + margin;
+    const BED_W = 256.0;
+    const BED_H = 256.0;
+    const PEN_OFFSET_X = 0.0;
+    const PEN_OFFSET_Y = 50.0; // pen mounted 50mm forward of nozzle
+
+    const effectiveBedW = BED_W;
+    const effectiveBedH = BED_H - PEN_OFFSET_Y;
+
+    const printableW = effectiveBedW - (2 * margin);
+    const printableH = effectiveBedH - (2 * margin);
+
+    const scale = Math.min(printableW / paperW, printableH / paperH);
+
+    const offsetX = (effectiveBedW / 2) - ((paperW * scale) / 2);
+    const offsetY = (effectiveBedH / 2) - ((paperH * scale) / 2);
+
+    const toGX = (x) => offsetX + (x * scale) + PEN_OFFSET_X;
+    const toGY = (y) => offsetY + ((paperH - y) * scale) + PEN_OFFSET_Y;
 
     const files = [];
 
@@ -643,9 +653,9 @@ M84
 
         gcode += `G1 Z${zUp} F3000 ; pen up\n`;
 
-        const fx = marginX(pts[0].x);
-        const fy = marginY(pts[0].y);
-        gcode += `G1 X${fx.toFixed(3)} Y${(paperH - fy).toFixed(3)} F${feedrate}\n`;
+        const fx = toGX(pts[0].x);
+        const fy = toGY(pts[0].y);
+        gcode += `G1 X${fx.toFixed(3)} Y${fy.toFixed(3)} F${feedrate}\n`;
         gcode += `G1 Z${zDown.toFixed(3)} F3000 ; pen down\n`;
         totalPoints++;
 
@@ -653,15 +663,15 @@ M84
         let prevY = fy;
 
         for (let i = 1; i < pts.length; i++) {
-          const mx = marginX(pts[i].x);
-          const my = marginY(pts[i].y);
+          const mx = toGX(pts[i].x);
+          const my = toGY(pts[i].y);
           const dx = mx - prevX;
           const dy = my - prevY;
 
           // Skip microscopic line segments (< 0.1mm)
           if ((dx * dx + dy * dy) < 0.01) continue;
 
-          gcode += `G1 X${mx.toFixed(3)} Y${(paperH - my).toFixed(3)} F${feedrate}\n`;
+          gcode += `G1 X${mx.toFixed(3)} Y${my.toFixed(3)} F${feedrate}\n`;
           totalPoints++;
           prevX = mx;
           prevY = my;
@@ -731,8 +741,8 @@ M84
         gcode += 'M3 S1000 ; spindle on (pen down)\n';
 
         for (const pt of pts) {
-          const x = Math.max(margin, Math.min(paperW - margin, marginX(pt.x)));
-          const y = Math.max(margin, Math.min(paperH - margin, marginY(pt.y)));
+          const x = marginX(pt.x);
+          const y = marginY(pt.y);
           gcode += `G1 X${x.toFixed(3)} Y${y.toFixed(3)} F${feedrate}\n`;
           totalPoints++;
         }

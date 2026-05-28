@@ -6,12 +6,17 @@ import { generateSquiggle } from './Squiggle.js';
 import { generateCrosshatch } from './Crosshatch.js';
 import { generateStipple } from './Stipple.js';
 import { generateFlowField } from './FlowField.js';
-import { generateMarchingSquares } from './MarchingSquares.js';
 import { generateVectorTrace } from './VectorTrace.js';
 import { generateModulatedSpiral } from './ModulatedSpiral.js';
 import { generateSkeletonTrace } from './Skeletonize.js';
 import { generateCalligraphy } from './Calligraphy.js';
 import { applyXDoG, chainEdgesToPaths } from './SubjectOutline.js';
+import { generatePhaseModulationMoire } from './PhaseModulationMoire.js';
+import { generateCurvilinearNoiseMoire } from './CurvilinearNoiseMoire.js';
+import { generateWarpedGridMoire } from './WarpedGridMoire.js';
+import { generateFreqModMoire } from './FreqModMoire.js';
+import { generateStaticMoireFringe } from './StaticMoireFringe.js';
+import { generateTopoContour } from './TopoContour.js';
 
 /**
  * Run the selected algorithm, populating the Paper.js project's active layer.
@@ -30,6 +35,17 @@ export async function runAlgorithm(algo, project, imageData, params = {}, onProg
           resolution = 2, threshold = 128,
           tolerance = 1, blurRadius = 0, pathomit = 8, minPathLength = 5,
           linesCount = 10,
+          angleDeg = 3, amplitude = 0.5,
+          pitch = 12, fringeDensity = 0.8,
+          carrierType = 'circles', carrierAngle = '0',
+          lineDensity = 60, contourHeight = 5, topoAngle = '45',
+          noiseGridAngle1 = 30, noiseGridAngle2 = 60,
+          noiseScale = 300, noiseAmplitude = 3, fringeIntensity = 0.8,
+          moireLayerView = 'both',
+          warpAngle1 = 45, warpAngle2 = 135,
+          keyGeometry = 'lines',
+          warpIntensity = 1.5,
+          dispBlur = 15,
           penConstraints = {},
           calibrationProfile = 'sharpieFinePoint',
           pixelsPerMm = 4,
@@ -71,10 +87,6 @@ export async function runAlgorithm(algo, project, imageData, params = {}, onProg
     case 'vectorsvg':
       // Vector algorithm: SVG paths are already imported by main.js via Paper.js.
       // No raster processing needed — the SVG vector data stays as Paper.js paths.
-      break;
-
-    case 'scanline':
-      generateMarchingSquares(project, imageData, resolution, threshold);
       break;
 
     case 'vectortrace':
@@ -126,6 +138,50 @@ export async function runAlgorithm(algo, project, imageData, params = {}, onProg
       }
       break;
     }
+
+    case 'phasemoire':
+      generatePhaseModulationMoire(project, grayscaleData || imageData, density, angleDeg, amplitude);
+      break;
+
+    case 'staticmoire':
+      generateStaticMoireFringe(
+        project, grayscaleData || imageData,
+        pitch, fringeDensity, blurRadius, carrierType, carrierAngle,
+      );
+      break;
+
+    case 'topocontour':
+      generateTopoContour(
+        project, grayscaleData || imageData,
+        lineDensity, contourHeight, blurRadius, topoAngle,
+      );
+      break;
+
+    case 'freqmod':
+      generateFreqModMoire(
+        project, grayscaleData || imageData,
+        pitch, keyGeometry, warpAngle1, warpAngle2,
+        warpIntensity, dispBlur, noiseScale, noiseAmplitude, blurRadius, moireLayerView,
+      );
+      break;
+
+    case 'warpedgrid':
+      generateWarpedGridMoire(
+        project, grayscaleData || imageData,
+        pitch, warpAngle1,
+        noiseScale, noiseAmplitude, blurRadius, moireLayerView,
+        params.keyType ?? 'noise',
+      );
+      break;
+
+    case 'curvilinearnoise':
+      generateCurvilinearNoiseMoire(
+        project, grayscaleData || imageData,
+        pitch, noiseGridAngle1, noiseGridAngle2,
+        noiseScale, noiseAmplitude, fringeIntensity, blurRadius,
+        moireLayerView,
+      );
+      break;
 
     case 'subjectoutline': {
       const binary = applyXDoG(

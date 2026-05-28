@@ -316,17 +316,66 @@ function chainSegments(segments, tolerance) {
 }
 
 /**
+ * Sort Paper.js point-array chains for minimum pen travel (flip-aware).
+ *
+ * Checks both the start AND end of each undrawn chain.  If the end is closer
+ * to the current pen position than the start, the chain is reversed so the
+ * plotter draws back-and-forth (boustrophedon) instead of always repositioning
+ * to the same side of the canvas between strokes.
+ *
+ * @param {Array<Array<paper.Point>>} chains
+ * @returns {Array<Array<paper.Point>>}
+ */
+function sortChainsForPlotter(chains) {
+  if (chains.length <= 1) return chains;
+
+  const n = chains.length;
+  const used = new Uint8Array(n);
+  const result = [];
+  let cx = 0, cy = 0;
+
+  for (let pass = 0; pass < n; pass++) {
+    let bestIdx = -1, bestDist = Infinity, bestFlip = false;
+
+    for (let i = 0; i < n; i++) {
+      if (used[i]) continue;
+      const c = chains[i];
+      const s = c[0], e = c[c.length - 1];
+      const ds = (s.x - cx) ** 2 + (s.y - cy) ** 2;
+      const de = (e.x - cx) ** 2 + (e.y - cy) ** 2;
+      const nearest = ds <= de ? ds : de;
+      if (nearest < bestDist) {
+        bestDist = nearest;
+        bestIdx  = i;
+        bestFlip = de < ds;
+      }
+    }
+
+    used[bestIdx] = 1;
+    const chain = bestFlip ? [...chains[bestIdx]].reverse() : chains[bestIdx];
+    result.push(chain);
+    const last = chain[chain.length - 1];
+    cx = last.x;
+    cy = last.y;
+  }
+
+  return result;
+}
+
+/**
  * Optimize a Paper.js project for plotter output.
  *
  * Performs:
  * 1. Segment Deduplication — removes overlapping/redundant line segments
  * 2. Greedy Path Chaining — connects segments into continuous paths
- * 3. Cleanup — replaces old paths with optimized ones, applies plotter styles
+ * 3. Proximity Sort — orders chains for minimum pen travel (bidirectional)
+ * 4. Cleanup — replaces old paths with optimized ones, applies plotter styles
  *
  * @param {paper.Project} project — the Paper.js project to optimize
  * @param {number} [tolerance=0.1] — spatial tolerance in mm (default 0.1mm)
  */
 export function optimizeForPlotter(project, tolerance = 0.1) {
+  project.activate(); // ensure new paper.Path() calls target this project, not the main preview
   const layer = project.activeLayer;
   if (!layer || layer.children.length === 0) return;
 
@@ -356,10 +405,13 @@ export function optimizeForPlotter(project, tolerance = 0.1) {
   // ── Step 3: Greedy path chaining ──────────────────────────
   const chains = chainSegments(uniqueSegments, tolerance);
 
-  // ── Step 4: Cleanup — replace old paths with optimized ones ──
+  // ── Step 4: Proximity sort (bidirectional / boustrophedon) ──
+  const sorted = sortChainsForPlotter(chains);
+
+  // ── Step 5: Cleanup — replace old paths with optimized ones ──
   layer.removeChildren();
 
-  for (const chain of chains) {
+  for (const chain of sorted) {
     if (chain.length < 2) continue;
 
     const path = new paper.Path();

@@ -193,12 +193,16 @@ export default function SettingsPanel({
     { id: 'flowfield', label: 'Flow Field' },
     { id: 'modulatedspiral', label: 'Modulated Spiral' },
     { id: 'vectorsvg', label: 'Vector' },
-    { id: 'scanline', label: 'Contour' },
     { id: 'vectortrace', label: 'Topographic Map' },
     { id: 'skeletonize', label: 'Skeletonize' },
     { id: 'calligraphy', label: 'Calligraphy' },
     { id: 'subjectoutline',    label: 'Subject Outline' },
     { id: 'outlinecrosshatch', label: 'Outline + Hatch' },
+    { id: 'staticmoire',       label: 'Static Moiré' },
+    { id: 'topocontour',       label: 'Topo Contour' },
+    { id: 'curvilinearnoise',  label: 'Curvilinear Noise Moiré' },
+    { id: 'freqmod',           label: 'Freq. Mod. Moiré' },
+    { id: 'warpedgrid',        label: 'Phase-Key Moiré' },
   ];
 
   return (
